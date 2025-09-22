@@ -11,6 +11,13 @@
 #   - Background SMART temperature sampling during run
 #   - Temperature min/max and color-coded summary in report
 #   - --dry mode to simulate everything without touching disks
+#
+# Updates (added on top of the original):
+#   - New subcommands: resume [drive] | list
+#   - Background runs are de-prioritized (nohup + ionice + nice) and tracked with PID→drive mapping
+#   - Foreground mode option with interactive progress gauge (max resources) + summary on completion
+#   - Elapsed-time tracking for runs (shown in list/stop)
+#   - Dependency check remains fail-fast, but now prints install guidance
 
 set -euo pipefail
 
@@ -34,16 +41,37 @@ die() { echo "❌ $*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- Helpers ----------
+elapsed_time() {
+  if [ -f "$LOGDIR/starttime.txt" ]; then
+    local start now secs
+    start=$(cat "$LOGDIR/starttime.txt")
+    now=$(date +%s)
+    secs=$((now - start))
+    printf "%02d:%02d:%02d" $((secs/3600)) $((secs%3600/60)) $((secs%60))
+  else
+    echo "N/A"
+  fi
+}
+
+smart_dump() { local d=$1; local when=$2; smartctl -a "/dev/$d" > "$LOGDIR/${d}-smart-${when}.log" 2>&1 || true; }
+
 # ---------- Subcommands (no kill-switch needed) ----------
 show_status()  { echo "========= StressDisk Status ========="; ps aux | grep '[s]tressdisk' || true; }
+
+# stop_all now supports PID→drive mapping file
 stop_all()     {
   echo "========= Stopping StressDisk ========="
   if [ -f "$LOGDIR/pids.txt" ]; then
-    xargs -r kill < "$LOGDIR/pids.txt" 2>/dev/null || true
+    awk '{print $1}' "$LOGDIR/pids.txt" | xargs -r kill 2>/dev/null || true
     rm -f "$LOGDIR/pids.txt"
   fi
   pkill -9 stressdisk 2>/dev/null || true
+  echo
+  echo "========= Summary ========="
+  echo "Elapsed time       : $(elapsed_time)"
 }
+
 clean_all()    {
   echo "========= Cleaning StressDisk mounts ========="
   for m in "$MNTROOT"/*; do
@@ -52,6 +80,7 @@ clean_all()    {
     umount "$m" 2>/dev/null || true
   done
 }
+
 report_all()   {
   echo "========= Burn-In SMART & Temperature Report ========="
   echo
@@ -137,11 +166,72 @@ report_all()   {
   echo
 }
 
+# NEW: resume [drive] → tail logs live (all or specific drive)
+resume_logs() {
+  local target="${1:-}"
+
+  echo "========= Live Burn-In Logs ========="
+  echo
+
+  if [ -n "$target" ]; then
+    local logfile="$LOGDIR/${target}.log"
+    if [ -f "$logfile" ]; then
+      echo -e "📄 $(color blue "$logfile")"
+      tail -n 20 -f "$logfile"
+    else
+      echo "❌ No logfile found for /dev/$target"
+    fi
+  else
+    shopt -s nullglob
+    local any=0
+    for logfile in "$LOGDIR"/*.log; do
+      any=1
+      echo -e "📄 $(color blue "$logfile")"
+      tail -n 20 -f "$logfile" &
+    done
+    shopt -u nullglob
+    [ $any -eq 0 ] && echo "⚠️  No logs found in $LOGDIR"
+    wait || true
+  fi
+}
+
+# NEW: list → show PID→drive mappings + running state + elapsed
+list_jobs() {
+  echo "========= Active Burn-In Jobs ========="
+  echo
+
+  if [ ! -f "$LOGDIR/pids.txt" ]; then
+    echo "⚠️  No active job mappings found."
+  else
+    while read -r pid drive; do
+      if [ -z "${pid:-}" ] || [ -z "${drive:-}" ]; then
+        continue
+      fi
+      if kill -0 "$pid" 2>/dev/null; then
+        echo -e "🟢 PID $pid → /dev/$drive (log: $LOGDIR/$drive.log)"
+      else
+        echo -e "🔴 PID $pid → /dev/$drive (not running)"
+      fi
+    done < "$LOGDIR/pids.txt"
+  fi
+
+  echo
+  echo "========= Summary ========="
+  if [ -f "$LOGDIR/pids.txt" ]; then
+    echo "Total jobs tracked : $(wc -l < "$LOGDIR/pids.txt")"
+  else
+    echo "Total jobs tracked : 0"
+  fi
+  echo "Elapsed time       : $(elapsed_time)"
+}
+
 case "${1:-}" in
   status) show_status; exit 0;;
   stop)   stop_all;   exit 0;;
   clean)  clean_all;  exit 0;;
   report) report_all; exit 0;;
+  resume) shift; resume_logs "$@"; exit 0;;
+  list)   list_jobs; exit 0;;
 esac
 
 # ---------- Global kill-switch (only for main runs) ----------
@@ -152,7 +242,7 @@ if [[ "$global_confirm" != "yes" ]]; then
   exit 1
 fi
 
-# ---------- Dependency check ----------
+# ---------- Dependency check (fail fast + guidance) ----------
 missing=()
 have whiptail    || missing+=("whiptail")
 have smartctl    || missing+=("smartmontools")
@@ -160,15 +250,19 @@ have stressdisk  || missing+=("stressdisk")
 
 if [ ${#missing[@]} -ne 0 ]; then
   echo "❌ Missing required packages/binaries: ${missing[*]}"
-  echo "   Install them with:"
-  echo "     apt update && apt install -y whiptail smartmontools"
-  echo "   For stressdisk, either:"
-  echo "     # binary (x86_64):"
-  echo "     ver=\$(curl -s https://api.github.com/repos/ncw/stressdisk/releases/latest | grep tag_name | cut -d '\"' -f4 | sed 's/^v//')"
-  echo "     curl -L -o /usr/local/bin/stressdisk https://github.com/ncw/stressdisk/releases/download/v\${ver}/stressdisk_linux_x86_64"
-  echo "     chmod +x /usr/local/bin/stressdisk"
-  echo "     # or build via Go:"
-  echo "     apt install -y golang && GOBIN=/usr/local/bin go install github.com/ncw/stressdisk@latest"
+  echo
+  echo "To install the missing dependencies, run:"
+  echo "  sudo apt update && sudo apt install -y whiptail smartmontools"
+  echo
+  echo "For stressdisk:"
+  echo "  # Download the latest binary (x86_64):"
+  echo "  ver=\$(curl -s https://api.github.com/repos/ncw/stressdisk/releases/latest | grep tag_name | cut -d '\"' -f4 | sed 's/^v//')"
+  echo "  curl -L -o /usr/local/bin/stressdisk https://github.com/ncw/stressdisk/releases/download/v\${ver}/stressdisk_linux_x86_64"
+  echo "  chmod +x /usr/local/bin/stressdisk"
+  echo
+  echo "  # Or build via Go:"
+  echo "  sudo apt install -y golang && GOBIN=/usr/local/bin go install github.com/ncw/stressdisk@latest"
+  echo
   exit 1
 fi
 
@@ -184,7 +278,7 @@ esac
 # list raw "disk" devices; we'll mark in-use later
 mapfile -t ALL_DISKS < <(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1}')
 
-# helpers to mark in-use states
+# helpers to mark in-use states (same behavior as original)
 is_in_zfs()  { have zpool && zpool status 2>/dev/null | grep -qE "(^|\s)/dev/$1(\s|$)"; }
 is_in_md()   {
   # linux_raid_member fstype OR mention in /proc/mdstat
@@ -252,7 +346,7 @@ case "${mode_choice:-3}" in
   *) MODE="verify" ;;
 esac
 
-# ---------- Safety prompts ----------
+# ---------- Safety prompts (unchanged behavior) ----------
 warn_and_confirm() {
   local d=$1; local action=$2
   echo -e "$(color red "⚠️  WARNING: This will $action on /dev/$d")"
@@ -261,6 +355,7 @@ warn_and_confirm() {
   [[ "$typed" == "/dev/$d" ]]
 }
 
+# preserve original prep (optional format + mount)
 smart_dump()    { local d=$1; local when=$2; smartctl -a "/dev/$d" > "$LOGDIR/${d}-smart-${when}.log" 2>&1 || true; }
 
 prep_drive() {
@@ -280,7 +375,36 @@ prep_drive() {
   fi
 }
 
-run_stress() {
+# ---------- Background vs Foreground selection (NEW) ----------
+echo
+read -r -p "Run in background (safe) or foreground (max resources)? [b/f]: " RUNMODE
+[[ "$RUNMODE" =~ ^[bf]$ ]] || die "Invalid choice."
+
+# ---------- Temperature sampler (works for both modes) ----------
+sample_temps() {
+  local d=$1
+  local pid_match="$2"   # optional PID, preferred when available
+  while :; do
+    if [ -n "${pid_match:-}" ]; then
+      kill -0 "$pid_match" 2>/dev/null || break
+    else
+      # Fallback: detect any stressdisk working on this mount path
+      pgrep -f "stressdisk.*${MNTROOT}/${d}" >/dev/null || break
+    fi
+    local ts temp
+    ts=$(date +'%F %T')
+    temp=$(smartctl -a "/dev/$d" 2>/dev/null | \
+           grep -E 'Temperature(_Celsius)?|Airflow_Temperature|Composite Temperature|Temperature:' | \
+           grep -Eo '[0-9]{2,3}' | head -1)
+    if [[ -n "${temp:-}" ]]; then
+      echo "$ts $temp" >> "$LOGDIR/${d}-temps.log"
+    fi
+    sleep 300
+  done
+}
+
+# ---------- Run functions ----------
+run_stress_background() {
   local d=$1 dur=$2 mode=$3
 
   if [[ "$mode" == "run" || "$mode" == "cycle" ]]; then
@@ -298,62 +422,166 @@ run_stress() {
   smart_dump "$d" "before"
 
   echo "== STARTING StressDisk on /dev/$d for $dur ($mode) =="
-  stdbuf -oL -eL stressdisk -duration "$dur" -logfile "$LOGDIR/$d.log" "$mode" "$MNTROOT/$d" &
+  # De-prioritized to avoid host impact
+  nohup ionice -c2 -n7 nice -n 19 \
+    stdbuf -oL -eL stressdisk -duration "$dur" -logfile "$LOGDIR/$d.log" "$mode" "$MNTROOT/$d" \
+    >> "$LOGDIR/$d.log" 2>&1 &
+
   local pid=$!
-  echo "$pid" >> "$LOGDIR/pids.txt"
+  echo "$pid $d" >> "$LOGDIR/pids.txt"
 
   # background: wait for completion, then SMART after
-  (
-    wait "$pid" || true
+  ( wait "$pid" || true
     echo "== Capturing SMART after test for /dev/$d =="
     smart_dump "$d" "after"
   ) &
 
-  # background: temperature sampler (every 5 min)
-  (
-    while kill -0 "$pid" 2>/dev/null; do
-      ts=$(date +'%F %T')
-      # Try to extract a plausible temperature (ATA/NVMe variants)
-      temp=$(smartctl -a "/dev/$d" 2>/dev/null | \
-             grep -E 'Temperature(_Celsius)?|Airflow_Temperature|Composite Temperature|Temperature:' | \
-             grep -Eo '[0-9]{2,3}' | head -1)
-      if [[ -n "${temp:-}" ]]; then
-        echo "$ts $temp" >> "$LOGDIR/${d}-temps.log"
+  # background: temperature sampler
+  ( sample_temps "$d" "$pid" ) &
+}
+
+run_stress_foreground() {
+  local d=$1 dur=$2 mode=$3
+
+  if [[ "$mode" == "run" || "$mode" == "cycle" ]]; then
+    warn_and_confirm "$d" "RUN StressDisk in '$mode' mode (writes over data)" || { echo "❌ Skipping /dev/$d"; return 1; }
+  fi
+
+  if $DRYRUN; then
+    echo "(dry-run) Would run StressDisk on /dev/$d for $dur in $mode mode (foreground)"
+    return 0
+  fi
+
+  prep_drive "$d" || return 1
+
+  echo "== Capturing SMART baseline for /dev/$d =="
+  smart_dump "$d" "before"
+
+  echo "== RUNNING (foreground) StressDisk on /dev/$d for $dur ($mode) =="
+  # Full-speed foreground; still write a logfile; parse % for gauge
+  stdbuf -oL -eL stressdisk -duration "$dur" -logfile "$LOGDIR/$d.log" "$mode" "$MNTROOT/$d" 2>&1 | \
+  tee -a "$LOGDIR/$d.log" | \
+  awk '
+    {
+      # Emit any N% token as a gauge value
+      while (match($0, /([0-9]+)%/, m)) {
+        print m[1];
+        $0 = substr($0, RSTART+RLENGTH);
+        fflush();
+      }
+    }
+  ' | whiptail --gauge "Burn-in progress for /dev/$d" 8 70 0
+
+  echo "== Capturing SMART after test for /dev/$d =="
+  smart_dump "$d" "after"
+
+  # temp sampling: attempt a brief sweep after completion to record last values
+  ( sample_temps "$d" "" ) &
+}
+
+foreground_summary() {
+  echo
+  echo "========= Foreground Burn-In Summary ========="
+  echo
+
+  for d in "${TARGETS[@]}"; do
+    local before="$LOGDIR/${d}-smart-before.log"
+    local after="$LOGDIR/${d}-smart-after.log"
+    local tempslog="$LOGDIR/${d}-temps.log"
+
+    [ -f "$before" ] || continue
+
+    echo -e "$(color blue "/dev/$d")"
+    echo "----------------------------------------"
+
+    local drive_status="ok"
+    local ATTRS="Reallocated Pending Offline Uncorrect CRC Temperature"
+    for attr in $ATTRS; do
+      local b=$(grep -i "$attr" "$before" | tail -n1 || true)
+      local a=$(grep -i "$attr" "$after"  | tail -n1 || true)
+      if [ -n "$b" ] && [ -n "$a" ] && [ "$b" != "$a" ]; then
+        echo -e "⚠️  $(color yellow "$attr changed:")"
+        echo "   Before: $b"
+        echo "   After : $a"
+        drive_status="warn"
+        [[ "$attr" =~ ^(Reallocated|Pending|Offline)$ ]] && drive_status="fail"
       fi
-      sleep 300
     done
-  ) &
+
+    if [ -f "$tempslog" ] && [ -s "$tempslog" ]; then
+      local min max
+      min=$(awk '{print $NF}' "$tempslog" | sort -n | head -1 || true)
+      max=$(awk '{print $NF}' "$tempslog" | sort -n | tail -1 || true)
+      if [ -n "$max" ]; then
+        if [ "$max" -ge 60 ]; then
+          echo -e "   🚨 $(color red "Max Temp: ${max}°C (too hot!)")"
+          drive_status="fail"
+        elif [ "$max" -ge 55 ]; then
+          echo -e "   ⚠️  $(color yellow "Max Temp: ${max}°C (warm)")"
+          [ "$drive_status" = "ok" ] && drive_status="warn"
+        else
+          echo -e "   $(color green "Max Temp: ${max}°C")"
+        fi
+        [ -n "$min" ] && echo "   Min Temp: ${min}°C"
+      fi
+    fi
+
+    case "$drive_status" in
+      ok)   echo -e "Status: 🟢 $(color green "OK")" ;;
+      warn) echo -e "Status: ⚠️  $(color yellow "Warning")" ;;
+      fail) echo -e "Status: 🚨 $(color red "Failed")" ;;
+    esac
+    echo
+  done
 }
 
 # ---------- Execute ----------
-for d in "${TARGETS[@]}"; do
-  run_stress "$d" "$DURATION" "$MODE"
-done
-
 if $DRYRUN; then
   echo
-  echo "========= DRY RUN COMPLETE ========="
-  echo "Would test drives:"
-  for d in "${TARGETS[@]}"; do
-    echo "  /dev/$d  ($MODE, $DURATION)"
-  done
-  echo "⚠️  No disks were touched. This was only a simulation."
-  exit 0
+  echo "========= DRY RUN PLAN ========="
+  echo "Mode     : (will prompt)"
+  echo "Duration : $DURATION"
+  echo "Targets  : ${TARGETS[*]/#/\/dev/}"
+  echo "⚠️  No disks will be touched."
+  # still ask run mode for completeness, but do nothing destructive
 fi
 
 echo
-echo "========= Burn-In Started ========="
-echo "Mode     : $MODE"
-echo "Duration : $DURATION"
-echo "Targets  : ${TARGETS[*]/#/\/dev/}"
-echo "Logs     : $LOGDIR/<disk>.log"
-echo "SMART    : $LOGDIR/<disk>-smart-before.log / <disk>-smart-after.log"
-echo "Temps    : $LOGDIR/<disk>-temps.log (5-min samples)"
-echo "PIDs     : $LOGDIR/pids.txt"
-echo
-echo "Commands:"
-echo "  burnin status   → show running jobs"
-echo "  burnin stop     → stop all StressDisk jobs"
-echo "  burnin clean    → unmount & clean test files"
-echo "  burnin report   → compare SMART before/after + temps (summary)"
-echo
+read -r -p "Run in background (safe) or foreground (max resources)? [b/f]: " RUNMODE2
+# If user typed earlier, keep that; otherwise use new answer
+if [[ ! "$RUNMODE" =~ ^[bf]$ ]]; then
+  RUNMODE="$RUNMODE2"
+  [[ "$RUNMODE" =~ ^[bf]$ ]] || die "Invalid choice."
+fi
+
+if [ "$RUNMODE" = "b" ]; then
+  for d in "${TARGETS[@]}"; do
+    run_stress_background "$d" "$DURATION" "$MODE"
+  done
+  if ! $DRYRUN; then
+    date +%s > "$LOGDIR/starttime.txt"
+  fi
+  echo
+  echo "========= Burn-In Started ========="
+  echo "Mode     : $MODE"
+  echo "Duration : $DURATION"
+  echo "Targets  : ${TARGETS[*]/#/\/dev/}"
+  echo "Logs     : $LOGDIR/<disk>.log"
+  echo "SMART    : $LOGDIR/<disk>-smart-before.log / <disk>-smart-after.log"
+  echo "Temps    : $LOGDIR/<disk>-temps.log (5-min samples)"
+  echo "PIDs     : $LOGDIR/pids.txt   # format: '<pid> <disk>'"
+  echo
+  echo "Commands:"
+  echo "  burnin status   → show running jobs"
+  echo "  burnin list     → list PID→drive, running state, elapsed time"
+  echo "  burnin resume   → tail logs (all or one drive: 'burnin resume sdb')"
+  echo "  burnin stop     → stop all StressDisk jobs"
+  echo "  burnin clean    → unmount & clean test files"
+  echo "  burnin report   → compare SMART before/after + temps (summary)"
+else
+  for d in "${TARGETS[@]}"; do
+    run_stress_foreground "$d" "$DURATION" "$MODE"
+  done
+  foreground_summary
+fi
+
