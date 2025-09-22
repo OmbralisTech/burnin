@@ -3,6 +3,7 @@
 burnin is a Bash wrapper around StressDisk designed for safe and automated drive burn-in testing on Debian/Proxmox systems. It provides an interactive, user-friendly way to exercise new or suspect drives, capture SMART data, and generate health reports.
 
 This script has been created, with the help of ChatGPT, to make StressDisk more useful in my homelab environment. It has a focus on safety, preventing a user from accidentally deleting data, and visibility to quickly undersand device health. 
+
 Key Features
 
     Interactive drive selection
